@@ -5,6 +5,7 @@ import threading
 import time
 import datetime
 import os
+import cv2
 
 PORT = "COM7"
 BAUD = 9600
@@ -17,9 +18,15 @@ except serial.SerialException as e:
 
 app = Flask(__name__)
 
+# Ensure images folder exists
+IMAGES_DIR = "images"
+os.makedirs(IMAGES_DIR, exist_ok=True)
+
 leaderboard = []
 current_stage = {"type": "landing", "value": None}
 time_shown_until = 0
+last_top_10_rank = None
+temp_new_entry = None
 player_data = {"name": "Player", "roll": "N/A"}
 
 HTML = """
@@ -42,6 +49,7 @@ HTML = """
         .player-form input { background: #444; color: #eee; }
         .player-form button { background: #0f0; color: #111; cursor: pointer; }
         .start-button { padding: 15px 30px; font-size: 24px; background: #f90; color: #111; border: none; border-radius: 10px; cursor: pointer; margin-top: 20px; }
+        .photo-button { padding: 10px 20px; font-size: 18px; background: #007bff; color: #fff; border: none; border-radius: 5px; cursor: pointer; margin-top: 10px; }
         .msg { font-size: 24px; color: #fff; margin-top: 20px; }
     </style>
     <script>
@@ -50,12 +58,14 @@ HTML = """
                 let r = await fetch("/stage");
                 if (!r.ok) return;
                 let data = await r.json();
-                
+
+                // Hide all states
                 document.getElementById('landingState').style.display = 'none';
                 document.getElementById('readyPage').style.display = 'none';
                 document.getElementById('gameState').style.display = 'none';
                 document.getElementById('resultState').style.display = 'none';
 
+                // Show the correct state based on current_stage
                 if(data.type === "landing" || data.type === "idle"){
                     document.getElementById('landingState').style.display = 'block';
                 }
@@ -70,9 +80,14 @@ HTML = """
                     document.getElementById('gameState').style.display = 'block';
                     document.getElementById('gameText').textContent = data.value;
                 }
-                else if(data.type === "time"){
+                else if(data.type === "time" || data.type === "new_record"){
                     document.getElementById('resultState').style.display = 'block';
                     document.getElementById('resultText').textContent = data.value;
+                    if(data.type === "new_record"){
+                        document.getElementById('photoButton').style.display = 'block';
+                    } else {
+                        document.getElementById('photoButton').style.display = 'none';
+                    }
                 }
             } catch (err) {
                 console.error("Error refreshing stage:", err);
@@ -98,32 +113,20 @@ HTML = """
         async function startGame() {
             await fetch("/set_stage/waiting");
         }
-        
-        async function getLeaderboard(){
-            let r = await fetch("/leaderboard");
-            let data = await r.json();
-            const tableBody = document.getElementById('leaderboardTableBody');
-            tableBody.innerHTML = '';
-            if (data.leaderboard.length === 0) {
-                tableBody.innerHTML = '<tr><td colspan="4">No times recorded yet</td></tr>';
+
+        async function takePicture() {
+            const res = await fetch("/take_picture");
+            const data = await res.json();
+            if (data.status === "success") {
+                alert("Picture saved for your new rank!");
+                window.location.reload(); 
             } else {
-                data.leaderboard.forEach((entry, i) => {
-                    tableBody.innerHTML += `
-                        <tr>
-                            <td>#${i+1}</td>
-                            <td>${parseFloat(entry[0]).toFixed(3)} ms</td>
-                            <td>${entry[1]}</td>
-                            <td>${entry[2]}</td>
-                        </tr>`;
-                });
+                alert("Failed to take picture. " + data.message);
             }
         }
 
         setInterval(refreshPage, 1000);
-        window.onload = function() {
-            refreshPage();
-            getLeaderboard();
-        };
+        window.onload = refreshPage;
     </script>
 </head>
 <body>
@@ -149,28 +152,28 @@ HTML = """
 
         <div id="resultState" class="result-state">
             <div class='time' id="resultText"></div>
-            <p>Returning to home screen in 4 seconds...</p>
+            <p>Returning to home screen in 10 seconds...</p>
+            <button id="photoButton" class="photo-button" onclick="takePicture()">Click Picture</button>
         </div>
-    </div>
-    
-    <div class="leaderboard">
-        <h1>🏆 Fastest Reaction Leaderboard</h1>
-        <table class="leaderboard-table">
-            <thead>
-                <tr>
-                    <th>Rank</th>
-                    <th>Time (ms)</th>
-                    <th>Name</th>
-                    <th>Roll No.</th>
-                </tr>
-            </thead>
-            <tbody id="leaderboardTableBody">
-            </tbody>
-        </table>
     </div>
 </body>
 </html>
 """
+
+def capture_webcam_image(filename):
+    cap = cv2.VideoCapture(0)
+    if not cap.isOpened():
+        print("Could not open webcam!")
+        return False
+    ret, frame = cap.read()
+    if ret:
+        cv2.imwrite(os.path.join(IMAGES_DIR, filename), frame)
+        print(f"Webcam image saved to {filename}")
+        return True
+    else:
+        print("Failed to capture webcam image.")
+        return False
+    cap.release()
 
 @app.route("/")
 def index():
@@ -200,23 +203,82 @@ def set_stage(new_stage):
             ser = None
     return jsonify({"status": "stage updated", "stage": new_stage})
 
-@app.route("/leaderboard")
-def get_leaderboard():
-    global leaderboard
-    return jsonify({"leaderboard": leaderboard})
+@app.route("/take_picture")
+def take_picture_route():
+    global temp_new_entry, leaderboard
+    if temp_new_entry:
+        name = temp_new_entry[1].replace(" ", "_")
+        roll = temp_new_entry[2].replace("/", "_")
+        time_us = temp_new_entry[0]
+        filename = f"{name}_{time_us:.0f}.jpg"
+        
+        if capture_webcam_image(filename):
+            new_entry_with_photo = (temp_new_entry[0], temp_new_entry[1], temp_new_entry[2], temp_new_entry[3], filename)
+            
+            existing_leaderboard = []
+            try:
+                with open("leaderboard.txt", "r") as f:
+                    for row in f:
+                        parts = row.strip().split(",", 4)
+                        if len(parts) == 5:
+                            t_us, name, roll, t_stamp, fname = parts
+                            existing_leaderboard.append((float(t_us), name, roll, t_stamp, fname))
+            except FileNotFoundError:
+                pass
+            
+            existing_leaderboard.append(new_entry_with_photo)
+            existing_leaderboard = sorted(existing_leaderboard, key=lambda x: x[0])
+            leaderboard[:] = existing_leaderboard
+            
+            with open("leaderboard.txt", "w") as f:
+                for t in existing_leaderboard:
+                    f.write(f"{t[0]},{t[1]},{t[2]},{t[3]},{t[4]}\n")
+
+            temp_new_entry = None
+            return jsonify({"status": "success"})
+        else:
+            return jsonify({"status": "error", "message": "Webcam not available."}), 500
+    
+    return jsonify({"status": "error", "message": "No new record to photograph."}), 400
 
 @app.route("/stage")
 def get_stage():
-    global current_stage, time_shown_until
+    global current_stage, time_shown_until, temp_new_entry
     now = time.time()
-    
-    if current_stage["type"] == "time" and now >= time_shown_until:
+
+    # This is the corrected logic. It will now automatically save the entry
+    # and reset the page after 10 seconds if no picture is taken.
+    if current_stage["type"] in ["time", "new_record"] and now >= time_shown_until:
+        if temp_new_entry is not None:
+            # New entry exists but no photo was taken. Save with a placeholder.
+            existing_leaderboard = []
+            try:
+                with open("leaderboard.txt", "r") as f:
+                    for row in f:
+                        parts = row.strip().split(",", 4)
+                        if len(parts) == 5:
+                            t_us, name, roll, t_stamp, fname = parts
+                            existing_leaderboard.append((float(t_us), name, roll, t_stamp, fname))
+            except FileNotFoundError:
+                pass
+            
+            new_entry_with_placeholder = (temp_new_entry[0], temp_new_entry[1], temp_new_entry[2], temp_new_entry[3], "no_photo.png")
+            existing_leaderboard.append(new_entry_with_placeholder)
+            existing_leaderboard = sorted(existing_leaderboard, key=lambda x: x[0])
+            leaderboard[:] = existing_leaderboard
+
+            with open("leaderboard.txt", "w") as f:
+                for t in existing_leaderboard:
+                    f.write(f"{t[0]},{t[1]},{t[2]},{t[3]},{t[4]}\n")
+
+            temp_new_entry = None
+        
         current_stage = {"type": "landing", "value": None}
     
     return jsonify(current_stage)
 
 def read_serial():
-    global current_stage, time_shown_until, player_data, ser
+    global current_stage, time_shown_until, player_data, ser, temp_new_entry
     while True:
         if ser is None:
             time.sleep(2)
@@ -227,7 +289,7 @@ def read_serial():
                 print(f"Failed to reconnect: {e}")
             continue
 
-        if current_stage["type"] == "time":
+        if current_stage["type"] in ["time", "new_record"]:
             time.sleep(0.1)
             continue
         
@@ -250,23 +312,22 @@ def read_serial():
                     try:
                         with open("leaderboard.txt", "r") as f:
                             for row in f:
-                                parts = row.strip().split(",", 3)
-                                if len(parts) == 4:
-                                    t_val, name, roll, t_stamp = parts
-                                    existing_leaderboard.append((float(t_val), name, roll, t_stamp))
+                                parts = row.strip().split(",", 4)
+                                if len(parts) == 5:
+                                    t_us, name, roll, t_stamp, fname = parts
+                                    existing_leaderboard.append((float(t_us), name, roll, t_stamp, fname))
                     except FileNotFoundError:
                         pass
                     
-                    new_entry = (time_val, player_data["name"], player_data["roll"], timestamp)
-                    existing_leaderboard.append(new_entry)
-                    existing_leaderboard = sorted(existing_leaderboard, key=lambda x: x[0])
-                        
-                    with open("leaderboard.txt", "w") as f:
-                        for t in existing_leaderboard:
-                            f.write(f"{t[0]},{t[1]},{t[2]},{t[3]}\n")
+                    new_entry = (time_val, player_data["name"], player_data["roll"], timestamp, "N/A")
+                    
+                    if len(existing_leaderboard) < 10 or time_val < max(t[0] for t in existing_leaderboard):
+                        temp_new_entry = new_entry
+                        current_stage = {"type": "new_record", "value": time_to_display}
+                    else:
+                        current_stage = {"type": "time", "value": time_to_display}
 
-                    current_stage = {"type": "time", "value": time_to_display}
-                    time_shown_until = time.time() + 4
+                    time_shown_until = time.time() + 10
 
         except (ValueError, json.JSONDecodeError, serial.SerialException) as e:
             print(f"Error reading serial data: {e}")
@@ -278,8 +339,8 @@ if __name__ == "__main__":
         try:
             with open("leaderboard.txt", "r") as f:
                 for row in f:
-                    parts = row.strip().split(",", 3)
-                    if len(parts) == 4:
+                    parts = row.strip().split(",", 4)
+                    if len(parts) == 5:
                         leaderboard.append(tuple(parts))
         except:
             pass
